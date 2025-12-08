@@ -1,0 +1,328 @@
+# GEE-Codes
+
+// Land Cover Classification (Landsat 5 & 7 SR) - 6 Classes + OOB Validation
+// Classes: Agriculture, Builtup, Water, Grassland, Bareland, Natural Green
+
+
+//Parameters
+var dateStart = '2000-02-01'; // Changeable
+var dateEnd   = '2000-06-30'; // Changeable
+var cloudPerc = 5;
+var scaleM    = 30;
+var seed      = 42;
+
+//Collections
+var landsat5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2');
+var landsat7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2');
+
+//Function to apply scale factors
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)
+               .and(qa.bitwiseAnd(1 << 4).eq(0));
+  return ee.Image(image.updateMask(mask)
+              .addBands(opticalBands, null, true)
+              .addBands(thermalBands, null, true)
+              .copyProperties(image, ["system:time_start"]));
+}
+
+//Cloud/Shadow Mask
+function maskLandsat(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudMask  = qa.bitwiseAnd(1 << 3).eq(0);
+  var shadowMask = qa.bitwiseAnd(1 << 4).eq(0);
+  return image.updateMask(cloudMask.and(shadowMask))
+              .select(['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7','QA_PIXEL'])
+              .copyProperties(image, image.propertyNames());
+}
+
+//Add Spectral Indices
+function addIndices(img) {
+  var ndvi = img.normalizedDifference(['SR_B4','SR_B3']).rename('NDVI');
+  var evi = img.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6*RED - 7.5*BLUE + 1))', {
+      'NIR': img.select('SR_B4'),
+      'RED': img.select('SR_B3'),
+      'BLUE': img.select('SR_B1')
+    }).rename('EVI');
+  var savi = img.expression(
+    '((NIR - RED) / (NIR + RED + 0.5)) * 1.5', {
+      'NIR': img.select('SR_B4'),
+      'RED': img.select('SR_B3')
+    }).rename('SAVI');
+  var ndbi = img.normalizedDifference(['SR_B5','SR_B4']).rename('NDBI');
+  var bsi  = img.expression(
+    '((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))', {
+      'SWIR1': img.select('SR_B5'),
+      'RED'  : img.select('SR_B3'),
+      'NIR'  : img.select('SR_B4'),
+      'BLUE' : img.select('SR_B1')
+    }).rename('BSI');
+  var nbr = img.normalizedDifference(['SR_B4','SR_B7']).rename('NBR');
+  
+  return img.addBands([ndvi, evi, savi, ndbi, bsi, nbr]);
+}
+
+//Composite over User-Defined Time Range
+function getComposite(start, end) {
+  var col = ee.ImageCollection(landsat5.merge(landsat7))
+    .filterDate(start, end)
+    .filterBounds(table)
+    .filter(ee.Filter.lt('CLOUD_COVER', cloudPerc))
+    .map(applyScaleFactors)
+    .map(maskLandsat)
+    .map(addIndices);
+  return col.median().clip(table);
+}
+
+var img = getComposite(dateStart, dateEnd);
+
+//Training Points (6 Classes)
+Agriculture   = Agriculture.map(function(f){ return f.set('LC', 0); });
+Builtup       = Builtup.map(function(f){     return f.set('LC', 1); });
+Water         = Water.map(function(f){       return f.set('LC', 2); });
+Grassland     = Grassland.map(function(f){   return f.set('LC', 3); });
+Bareland      = Bareland.map(function(f){    return f.set('LC', 4); });
+NaturalGreen  = NaturalGreen.map(function(f){return f.set('LC', 5); });
+
+var training_points = Agriculture
+  .merge(Builtup)
+  .merge(Water)
+  .merge(Grassland)
+  .merge(Bareland)
+  .merge(NaturalGreen);
+
+//Improvement: Function for Stratified Sampling (n per class)
+function sampleNPerClass(fc, classProp, nPerClass, seed) {
+  var classValues = fc.aggregate_array(classProp).distinct();
+  var sampled = ee.FeatureCollection(classValues.map(function(cl) {
+    cl = ee.Number(cl);
+    var classFc = fc.filter(ee.Filter.eq(classProp, cl));
+    var classSize = classFc.size();
+    var actualN = ee.Number(nPerClass).min(classSize); // If class has fewer points, take all
+    var randomized = classFc.randomColumn('random', seed);
+    var sampledClass = randomized.sort('random').limit(actualN);
+    return sampledClass;
+  })).flatten();
+  return sampled;
+}
+
+//Improvement: Function for Stratified Train/Test Split
+function stratifiedTrainTestSplit(samples, classProp, trainFraction, seed) {
+  var classValues = samples.aggregate_array(classProp).distinct();
+  
+  // Train collection
+  var trainCollection = ee.FeatureCollection(classValues.map(function(cl) {
+    cl = ee.Number(cl);
+    var classSamples = samples.filter(ee.Filter.eq(classProp, cl));
+    var nClass = classSamples.size();
+    var nTrain = nClass.multiply(trainFraction).floor();
+    var randomized = classSamples.randomColumn('random', seed);
+    var trainClass = randomized.sort('random').limit(nTrain);
+    return trainClass;
+  })).flatten();
+  
+  // Test collection
+  var testCollection = ee.FeatureCollection(classValues.map(function(cl) {
+    cl = ee.Number(cl);
+    var classSamples = samples.filter(ee.Filter.eq(classProp, cl));
+    var nClass = classSamples.size();
+    var nTrain = nClass.multiply(trainFraction).floor();
+    var nTest = nClass.subtract(nTrain);
+    var randomized = classSamples.randomColumn('random', seed + 1);
+    var testClass = randomized.sort('random').limit(nTest);
+    return testClass;
+  })).flatten();
+  
+  return {train: trainCollection, test: testCollection};
+}
+
+//Features (Edit QA_PIXEL for error in RF)
+var feats = img.bandNames().remove('QA_PIXEL');
+
+//Sample training data
+var training_samples = img.sampleRegions({
+  collection: training_points,
+  properties: ['LC'],
+  scale: scaleM,
+  geometries: true
+});
+
+
+print('Train samples size:', training_samples.size());
+var classCounts = training_samples.aggregate_histogram('LC');
+print('Samples per class:', classCounts);
+
+//Improvement: Stratified Train/Test Split (70%)
+var split = stratifiedTrainTestSplit(training_samples, 'LC', 0.7, seed);
+var trainFC = split.train;
+var testFC = split.test;
+
+print('Train per class (stratified):', trainFC.aggregate_histogram('LC'));
+print('Test per class (stratified):', testFC.aggregate_histogram('LC'));
+
+//Random Forest ( trees=500, maxNodes=1000)
+var rfTrained = ee.Classifier.smileRandomForest({
+  numberOfTrees: 500,
+  variablesPerSplit: null, //  (sqrt(features))
+  minLeafPopulation: 1,
+  bagFraction: 0.7,
+  maxNodes: 1000,
+  seed: seed
+}).train({
+  features: trainFC,
+  classProperty: 'LC',
+  inputProperties: feats
+});
+
+//OOB Validation
+var explain = rfTrained.explain();
+var oobError = explain.getNumber('outOfBagErrorEstimate');
+var oobAccuracy = ee.Number(1).subtract(oobError);
+print('Out-of-Bag Error Estimate:', oobError);
+print('Out-of-Bag Accuracy:', oobAccuracy);
+
+// Optional: OOB Error vs. Number of Trees Chart 
+var treeCounts = ee.List.sequence(10, 500, 10); // From 10 to 500 trees, step 10
+var oobErrors = treeCounts.map(function(trees) {
+  var tempClassifier = ee.Classifier.smileRandomForest({
+    numberOfTrees: ee.Number(trees),
+    variablesPerSplit: null,
+    minLeafPopulation: 1,
+    bagFraction: 0.7,
+    maxNodes: 1000,
+    seed: seed
+  }).train({
+    features: trainFC,
+    classProperty: 'LC',
+    inputProperties: feats
+  });
+  return tempClassifier.explain().getNumber('outOfBagErrorEstimate');
+});
+
+var oobChart = ui.Chart.array.values({
+  array: ee.Array(oobErrors),
+  axis: 0,
+  xLabels: treeCounts
+}).setOptions({
+  title: 'OOB Error vs. Number of Trees',
+  hAxis: {title: 'Number of Trees'},
+  vAxis: {title: 'OOB Error'},
+  lineWidth: 2,
+  pointSize: 4
+});
+print(oobChart);
+
+//Internal Accuracy Assessment (on testFC)
+// Internal accuracy (on testFC)
+var testClassified = testFC.classify(rfTrained);
+var confusionMatrixInternal = testClassified.errorMatrix('LC','classification');
+print('Confusion Matrix (Internal):', confusionMatrixInternal);
+print('Overall Accuracy (Internal):', confusionMatrixInternal.accuracy());
+print('Kappa (Internal):', confusionMatrixInternal.kappa());
+
+// Per-class accuracies internal
+var producersAccuracyInternal = confusionMatrixInternal.producersAccuracy();
+var consumersAccuracyInternal = confusionMatrixInternal.consumersAccuracy();
+print('Producer\'s Accuracy (Internal):', producersAccuracyInternal);
+print('User\'s Accuracy (Internal):', consumersAccuracyInternal);
+
+//Classification
+var classified = img.classify(rfTrained);
+var modeFiltered = classified.focal_mode(1);
+
+//Calculate Area for Each Class (in Hectares)
+var areaImage = ee.Image.pixelArea().divide(10000).addBands(modeFiltered); // Convert area to hectares
+var areas = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'LC'
+  }),
+  geometry: table,
+  scale: scaleM,
+  maxPixels: 1e13
+});
+
+// Map class numbers to names and keep area as number
+var classNames = ee.List(['Agriculture', 'Builtup', 'Water', 'Grassland', 'Bareland', 'Natural Green']);
+var areaList = ee.List(areas.get('groups')).map(function(group) {
+  var groupDict = ee.Dictionary(group);
+  var classId = ee.Number(groupDict.get('LC')).toInt();
+  var className = classNames.get(classId);
+  var areaHa = ee.Number(groupDict.get('sum')); // Keep as number
+  return ee.Dictionary({
+    'Class': className,
+    'Area (ha)': areaHa
+  });
+});
+
+// Print area results with formatted numbers for display
+var areaListFormatted = areaList.map(function(item) {
+  var dict = ee.Dictionary(item);
+  return ee.Dictionary({
+    'Class': dict.get('Class'),
+    'Area (ha)': ee.Number(dict.get('Area (ha)')).format('%.2f')
+  });
+});
+print('Area per Class (Hectares):', areaListFormatted);
+
+//Create Bar Chart using ui.Chart in GEE
+var chart = ui.Chart.feature.byFeature({
+  features: ee.FeatureCollection(areaList.map(function(item) {
+    return ee.Feature(null, ee.Dictionary(item));
+  })),
+  xProperty: 'Class',
+  yProperties: ['Area (ha)']
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Landuse Area(ha)',
+  hAxis: {title: 'Landuse Class'},
+  vAxis: {title: 'Area (ha)', format: '####.##'},
+  legend: {position: 'none'},
+  colors: ['#08d422', '#ff1515', '#0abaff', '#7CFC00', '#ffee17', '#006400']
+});
+print(chart);
+
+//Visualization
+Map.centerObject(table, 11);
+Map.addLayer(img, {bands:['SR_B3','SR_B2','SR_B1'], min:0, max:0.3}, 'RGB Composite');
+
+var palette6 = [
+  '#08d422', // Agriculture
+  '#ff1515', // Builtup
+  '#0abaff', // Water
+  '#7CFC00', // Grassland
+  '#ffee17', // Bareland
+  '#006400'  // Natural Green Cover
+];
+
+Map.addLayer(classified, {min:0, max:5, palette: palette6}, 'Classified (Raw)');
+Map.addLayer(modeFiltered, {min:0, max:5, palette: palette6}, 'Classified 6 Classes (Smoothed)');
+
+//Export Classified Map as GeoTIFF
+Export.image.toDrive({
+  image: modeFiltered,        // Classified map
+  description: 'LandCover_TIF_OOB',
+  folder: 'GEE_Exports',      // Folder created in Google Drive
+  fileNamePrefix: 'LandCover_2000_OOB',
+  region: table,              // Study area (table)
+  scale: scaleM,              // Spatial resolution (meters)
+  crs: 'EPSG:4326',           // Coordinate system (changeable)
+  maxPixels: 1e12             // Reduced for speed
+});
+
+//Export Visualized Map as GeoTIFF
+Export.image.toDrive({
+  image: modeFiltered.visualize({min:0, max:5, palette: palette6}),
+  description: 'LandCover_Viz_TIF',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'LandCover_2000_Viz',
+  region: table,
+  scale: scaleM,
+  crs: 'EPSG:4326',
+  maxPixels: 1e12,
+  fileFormat: 'GEOTIFF'
+});
