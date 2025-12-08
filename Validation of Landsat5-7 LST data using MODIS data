@@ -1,0 +1,211 @@
+#GEEcode
+
+var roi = table;
+var startDate = '2000-01-01';
+var endDate   = '2001-01-01';
+
+// ============================
+// PREPARE LANDSAT 5 & 7 COLLECTION
+// ============================
+function prepLandsat(start, end) {
+  var l5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+    .filterBounds(roi).filterDate(start, end).filter(ee.Filter.lt('CLOUD_COVER', 10));
+  var l7 = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2")
+    .filterBounds(roi).filterDate(start, end).filter(ee.Filter.lt('CLOUD_COVER', 10));
+  var merged = l5.merge(l7);
+
+  return merged.map(function(image) {
+    var lst = image.select('ST_B6')
+      .multiply(0.00341802).add(149.0)
+      .subtract(273.15)
+      .rename('LST_Landsat');
+
+    lst = lst.reduceResolution({
+        reducer: ee.Reducer.mean(),
+        bestEffort: true,
+        maxPixels: 1024
+      })
+      .reproject({crs: 'EPSG:4326', scale: 1000});
+
+    return lst.clip(roi).set('system:time_start', image.get('system:time_start'));
+  });
+}
+
+var landsatCol = prepLandsat(startDate, endDate);
+
+// ============================
+// PREPARE MODIS COLLECTION
+// ============================
+var modisCol = ee.ImageCollection('MODIS/061/MOD11A1')
+  .filterDate(startDate, endDate)
+  .filterBounds(roi);
+
+function processMODIS(img) {
+  var lst = img.select('LST_Day_1km');
+  var qc = img.select('QC_Day');
+  var mask = qc.bitwiseAnd(3).lte(1).and(qc.bitwiseAnd(12).eq(0));
+  var celsius = lst.updateMask(mask).multiply(0.02).subtract(273.15).rename('LST_MODIS');
+
+  celsius = celsius.reproject({crs: 'EPSG:4326', scale: 1000});
+  return celsius.clip(roi).set('system:time_start', img.get('system:time_start'));
+}
+
+var modisProcessed = modisCol.map(processMODIS);
+
+// ============================
+// PAIR EACH LANDSAT WITH MODIS MEAN ±3 DAYS
+// ============================
+var threeDays = 3; // in days
+
+var pairedFeat = ee.FeatureCollection(
+  landsatCol.map(function(lImg) {
+    var lDate = ee.Date(lImg.get('system:time_start'));
+
+    // select MODIS images ±3 days
+    var modSubset = modisProcessed.filterDate(
+      lDate.advance(-threeDays, 'day'),
+      lDate.advance(threeDays, 'day')
+    );
+
+    // only compute mean if subset is not empty
+    var modMeanImg = ee.Algorithms.If(modSubset.size().gt(0),
+      modSubset.mean(),
+      null
+    );
+
+    var landsatMean = lImg.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: roi,
+      scale: 1000,
+      maxPixels: 1e10
+    }).get('LST_Landsat');
+
+    var modisMean = ee.Algorithms.If(modMeanImg,
+      ee.Image(modMeanImg).reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: roi,
+        scale: 1000,
+        maxPixels: 1e10
+      }).get('LST_MODIS'),
+      null
+    );
+
+    return ee.Feature(null, {
+      'Landsat_date': lDate.format('YYYY-MM-dd'),
+      'MODIS_mean_LST': modisMean,
+      'Landsat_LST': landsatMean,
+      'system_time': lImg.get('system:time_start')
+    });
+  })
+);
+
+// filter out nulls
+var pairedValid = pairedFeat.filter(ee.Filter.notNull(['MODIS_mean_LST', 'Landsat_LST']));
+var pairedSorted = pairedValid.sort('system_time');
+
+// ============================
+// COMPUTE METRICS
+// ============================
+var diffCol = pairedSorted.map(function(f) {
+  var d = ee.Number(f.get('Landsat_LST')).subtract(ee.Number(f.get('MODIS_mean_LST')));
+  return ee.Feature(null, {
+    'diff': d,
+    'diff2': d.multiply(d),
+    'absDiff': d.abs()
+  });
+});
+
+var bias = ee.Number(diffCol.reduceColumns({reducer: ee.Reducer.mean(), selectors: ['diff']}).get('mean'));
+var rmse = ee.Number(diffCol.reduceColumns({reducer: ee.Reducer.mean(), selectors: ['diff2']}).get('mean')).sqrt();
+var mae = ee.Number(diffCol.reduceColumns({reducer: ee.Reducer.mean(), selectors: ['absDiff']}).get('mean'));
+var pearson = ee.Number(ee.Dictionary(pairedSorted.reduceColumns({
+  reducer: ee.Reducer.pearsonsCorrelation(),
+  selectors: ['Landsat_LST', 'MODIS_mean_LST']
+})).get('correlation'));
+var r2 = pearson.pow(2);
+
+print('Number of pairs (with ±3 days MODIS mean):', pairedSorted.size());
+print('Bias (Landsat - MODIS) [°C]:', bias);
+print('RMSE [°C]:', rmse);
+print('MAE [°C]:', mae);
+print('Pearson r:', pearson);
+print('R²:', r2);
+
+// ============================
+// PLOTS
+// ============================
+print(ui.Chart.feature.byFeature({
+  features: pairedSorted,
+  xProperty: 'MODIS_mean_LST',
+  yProperties: ['Landsat_LST']
+}).setChartType('ScatterChart')
+  .setOptions({
+    title: 'Scatter: Landsat vs MODIS (mean ±3 days)',
+    hAxis: {title: 'MODIS mean LST (°C)'},
+    vAxis: {title: 'Landsat LST (°C)'},
+    pointSize: 4,
+    trendlines: {0: {showR2: true}}
+}));
+
+print(ui.Chart.feature.byFeature({
+  features: pairedSorted,
+  xProperty: 'Landsat_date',
+  yProperties: ['Landsat_LST','MODIS_mean_LST']
+}).setChartType('LineChart')
+  .setOptions({
+    title: 'Time series (paired ±3 days)',
+    hAxis: {title: 'Date'},
+    vAxis: {title: 'Temperature (°C)'},
+    lineWidth: 2, pointSize: 4
+}));
+
+// ============================
+// EXPORTS
+// ============================
+Export.table.toDrive({
+  collection: pairedSorted,
+  description: 'LST_Landsat_vs_MODIS_mean_plusminus3days',
+  folder: 'GEE',
+  fileFormat: 'CSV',
+  selectors: ['Landsat_date','MODIS_mean_LST','Landsat_LST']
+});
+
+Export.table.toDrive({
+  collection: ee.FeatureCollection([ee.Feature(null, {
+    'n_pairs': pairedSorted.size(),
+    'bias_C': bias,
+    'rmse_C': rmse,
+    'mae_C': mae,
+    'pearson_r': pearson,
+    'r_squared': r2
+  })]),
+  description: 'LST_Landsat_vs_MODIS_metrics_mean_plusminus3days',
+  folder: 'GEE',
+  fileFormat: 'CSV',
+  selectors: ['n_pairs','bias_C','rmse_C','mae_C','pearson_r','r_squared']
+});
+
+// ============================
+// ADD LAYERS TO MAP
+// ============================
+pairedSorted.evaluate(function(pairs) {
+  pairs.features.forEach(function(f) {
+    var ldate = f.properties.Landsat_date;
+    var lImg = landsatCol.filterDate(ldate, ee.Date(ldate).advance(1,'day')).mean().clip(roi).rename('Landsat_LST');
+
+    // MODIS mean layer only if subset exists
+    var modSubset = modisProcessed.filterDate(
+      ee.Date(ldate).advance(-threeDays,'day'),
+      ee.Date(ldate).advance(threeDays,'day')
+    );
+
+    if (modSubset.size().getInfo() > 0) {
+      var modImg = modSubset.mean().clip(roi).rename('MODIS_mean_LST');
+      Map.addLayer(modImg, {min:10,max:40,palette:['purple','pink','orange','yellow']}, 'MODIS mean ±3d ' + ldate);
+    }
+
+    Map.addLayer(lImg, {min:10,max:40,palette:['blue','green','yellow','red']}, 'Landsat ' + ldate);
+  });
+});
+
+Map.centerObject(roi,11);
