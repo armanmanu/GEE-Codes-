@@ -1,0 +1,309 @@
+#GEEcodes
+
+// Land Cover Classification (Landsat 8 & 9 SR) - 6 Classes + OOB Validation
+// Classes: Agriculture, Builtup, Waterbody, Grassland, Bareland, Natural Green
+
+
+//Parameters
+var dateStart = '2024-02-01'; // Changeable
+var dateEnd   = '2024-06-30'; // Changeable
+var cloudPerc = 5;
+var scaleM    = 30;
+var seed      = 42;
+
+//Study Area
+var table = table; // Replace with your path, e.g., 'users/johndoe/study_area'
+
+//Collections
+var landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2');
+var landsat9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2');
+
+//Apply Scale Factors
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 3).eq(0).and(qa.bitwiseAnd(1 << 4).eq(0));
+  return ee.Image(image.updateMask(mask)
+              .addBands(opticalBands, null, true)
+              .addBands(thermalBands, null, true)
+              .copyProperties(image, ["system:time_start"]));
+}
+
+//Cloud/Shadow Mask
+function maskLandsat(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudMask = qa.bitwiseAnd(1 << 3).eq(0); 
+  var shadowMask = qa.bitwiseAnd(1 << 4).eq(0); 
+  return image.updateMask(cloudMask.and(shadowMask))
+              .select(['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7','QA_PIXEL'])
+              .copyProperties(image, image.propertyNames());
+}
+
+//Add Spectral Indices
+function addIndices(img) {
+  var ndvi  = img.normalizedDifference(['SR_B5','SR_B4']).rename('NDVI');
+  var ndwi  = img.normalizedDifference(['SR_B3','SR_B5']).rename('NDWI');
+  var ndbi  = img.normalizedDifference(['SR_B6','SR_B7']).rename('NDBI');
+  var bsi   = img.expression(
+    '((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))',{
+      'SWIR1': img.select('SR_B6'),
+      'RED'  : img.select('SR_B4'),
+      'NIR'  : img.select('SR_B5'),
+      'BLUE' : img.select('SR_B2')
+    }).rename('BSI');
+  return img.addBands([ndvi, ndwi, ndbi, bsi]);
+}
+
+//Annual Composite
+var img = ee.ImageCollection(landsat8.merge(landsat9))
+  .filterDate(dateStart, dateEnd)
+  .filterBounds(table)
+  .filter(ee.Filter.lt('CLOUD_COVER', cloudPerc))
+  .map(applyScaleFactors)
+  .map(maskLandsat)
+  .map(addIndices)
+  .median()
+  .clip(table);
+
+//Label Training Points (6 classes)
+Agriculture  = Agriculture.map(function(f){ return f.set('LC', 0); });
+Builtup      = Builtup.map(function(f){     return f.set('LC', 1); });
+Waterbody    = Waterbody.map(function(f){   return f.set('LC', 2); });
+Grassland    = Grassland.map(function(f){   return f.set('LC', 3); }); // مرتع
+Bareland     = Bareland.map(function(f){    return f.set('LC', 4); });
+NaturalGreen = NaturalGreen.map(function(f){return f.set('LC', 5); }); // پوشش سبز طبیعی
+
+var training_points = Agriculture
+  .merge(Builtup)
+  .merge(Waterbody)
+  .merge(Grassland)
+  .merge(Bareland)
+  .merge(NaturalGreen);
+
+//Improvement: Function for Stratified Sampling (n per class)
+function sampleNPerClass(fc, classProp, nPerClass, seed) {
+  var classValues = fc.aggregate_array(classProp).distinct();
+  var sampled = ee.FeatureCollection(classValues.map(function(cl) {
+    cl = ee.Number(cl);
+    var classFc = fc.filter(ee.Filter.eq(classProp, cl));
+    var classSize = classFc.size();
+    var actualN = ee.Number(nPerClass).min(classSize); // If class has fewer points, take all
+    var randomized = classFc.randomColumn('random', seed);
+    var sampledClass = randomized.sort('random').limit(actualN);
+    return sampledClass;
+  })).flatten();
+  return sampled;
+}
+
+//Improvement: Function for Stratified Train/Test Split
+function stratifiedTrainTestSplit(samples, classProp, trainFraction, seed) {
+  var classValues = samples.aggregate_array(classProp).distinct();
+  
+  // Train collection
+  var trainCollection = ee.FeatureCollection(classValues.map(function(cl) {
+    cl = ee.Number(cl);
+    var classSamples = samples.filter(ee.Filter.eq(classProp, cl));
+    var nClass = classSamples.size();
+    var nTrain = nClass.multiply(trainFraction).floor();
+    var randomized = classSamples.randomColumn('random', seed);
+    var trainClass = randomized.sort('random').limit(nTrain);
+    return trainClass;
+  })).flatten();
+  
+  // Test collection
+  var testCollection = ee.FeatureCollection(classValues.map(function(cl) {
+    cl = ee.Number(cl);
+    var classSamples = samples.filter(ee.Filter.eq(classProp, cl));
+    var nClass = classSamples.size();
+    var nTrain = nClass.multiply(trainFraction).floor();
+    var nTest = nClass.subtract(nTrain);
+    var randomized = classSamples.randomColumn('random', seed + 1);
+    var testClass = randomized.sort('random').limit(nTest);
+    return testClass;
+  })).flatten();
+  
+  return {train: trainCollection, test: testCollection};
+}
+
+//Features
+var feats = img.bandNames().remove('QA_PIXEL');
+
+//Sample training data
+var training_samples = img.sampleRegions({
+  collection: training_points,
+  properties: ['LC'],
+  scale: scaleM,
+  geometries: true
+});
+
+
+print('Train samples size:', training_samples.size());
+var classCounts = training_samples.aggregate_histogram('LC');
+print('Samples per class:', classCounts);
+
+//Improvement: Stratified Train/Test Split
+var split = stratifiedTrainTestSplit(training_samples, 'LC', 0.7, seed);
+var trainFC = split.train;
+var testFC = split.test;
+
+print('Train per class (stratified):', trainFC.aggregate_histogram('LC'));
+print('Test per class (stratified):', testFC.aggregate_histogram('LC'));
+
+//Random Forest
+var rfTrained = ee.Classifier.smileRandomForest({
+  numberOfTrees: 500,
+  variablesPerSplit: 5,
+  minLeafPopulation: 1,
+  bagFraction: 0.7,
+  maxNodes: 1000,
+  seed: seed
+}).train({
+  features: trainFC,
+  classProperty: 'LC',
+  inputProperties: feats
+});
+
+//OOB Validation
+var explain = rfTrained.explain();
+var oobError = explain.getNumber('outOfBagErrorEstimate');
+var oobAccuracy = ee.Number(1).subtract(oobError);
+print('Out-of-Bag Error Estimate:', oobError);
+print('Out-of-Bag Accuracy:', oobAccuracy);
+
+// Optional: OOB Error vs. Number of Trees Chart 
+var treeCounts = ee.List.sequence(10, 500, 10); // From 10 to 500 trees, step 10
+var oobErrors = treeCounts.map(function(trees) {
+  var tempClassifier = ee.Classifier.smileRandomForest({
+    numberOfTrees: ee.Number(trees),
+    variablesPerSplit: 5,
+    minLeafPopulation: 1,
+    bagFraction: 0.7,
+    maxNodes: 2000,
+    seed: seed
+  }).train({
+    features: trainFC,
+    classProperty: 'LC',
+    inputProperties: feats
+  });
+  return tempClassifier.explain().getNumber('outOfBagErrorEstimate');
+});
+
+var oobChart = ui.Chart.array.values({
+  array: ee.Array(oobErrors),
+  axis: 0,
+  xLabels: treeCounts
+}).setOptions({
+  title: 'OOB Error vs. Number of Trees',
+  hAxis: {title: 'Number of Trees'},
+  vAxis: {title: 'OOB Error'},
+  lineWidth: 2,
+  pointSize: 4
+});
+print(oobChart);
+
+//Internal Accuracy Assessment (on testFC)
+// Internal accuracy (on testFC)
+var testClassified = testFC.classify(rfTrained);
+var confusionMatrixInternal = testClassified.errorMatrix('LC','classification');
+print('Confusion Matrix (Internal):', confusionMatrixInternal);
+print('Overall Accuracy (Internal):', confusionMatrixInternal.accuracy());
+print('Kappa (Internal):', confusionMatrixInternal.kappa());
+
+// Per-class accuracies internal
+var producersAccuracyInternal = confusionMatrixInternal.producersAccuracy();
+var consumersAccuracyInternal = confusionMatrixInternal.consumersAccuracy();
+print('Producer\'s Accuracy (Internal):', producersAccuracyInternal);
+print('User\'s Accuracy (Internal):', consumersAccuracyInternal);
+
+//Classification
+var classified = img.classify(rfTrained);
+
+//Post-processing
+var modeFiltered = classified.focal_mode(1);
+
+//Visualization
+Map.centerObject(table, 11);
+Map.addLayer(img, {bands: ['SR_B4','SR_B3','SR_B2'], min: 0, max: 0.3}, 'RGB Composite');
+
+var palette6 = [
+  '#08d422', // 0 Agriculture
+  '#ff1515', // 1 Built-up
+  '#1E90FF', // 2 Water
+  '#7CFC00', // 3 Grassland
+  '#C2B280', // 4 Bareland
+  '#006400'  // 5 Natural Green
+];
+
+Map.addLayer(modeFiltered, {min:0, max:5, palette: palette6}, 'Classified (RF + Filtered)');
+
+//Area by Class (ha)
+var haImage   = ee.Image.pixelArea().divide(10000).rename('ha');
+var areaImage = haImage.addBands(modeFiltered.rename('LC'));
+var areaStats = areaImage.reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField:1, groupName:'LC'}),
+  geometry: table,
+  scale: scaleM,
+  maxPixels: 1e13
+});
+
+print('Class Areas (hectares) - grouped dict:', areaStats);
+
+var classAreas = ee.List(areaStats.get('groups'))
+  .map(function(item){
+    var dict = ee.Dictionary(item);
+    var lc   = ee.Number(dict.get('LC')).int();
+    var area = ee.Number(dict.get('sum'));
+    return ee.Feature(null, {'LC':lc,'Area_ha':area});
+  });
+
+classAreas = ee.FeatureCollection(classAreas);
+
+var lcNamesClient = ['Agriculture','BuiltUp','Water','Grassland','BareLand','NaturalGreen'];
+var lcNames       = ee.List(lcNamesClient);
+
+classAreas = classAreas.map(function(f){
+  var lc = ee.Number(f.get('LC')).int();
+  return f.set('Class', lcNames.get(lc));
+}).sort('LC');
+
+print('Class Area Table (sorted)', classAreas);
+
+var chart = ui.Chart.feature.byFeature(classAreas,'Class','Area_ha')
+  .setChartType('ColumnChart')
+  .setOptions({
+    title:'Land Cover Areas (ha)',
+    hAxis:{title:'Land Cover Class'},
+    vAxis:{title:'Area (ha)'},
+    legend:{position:'none'},
+    colors: palette6
+  });
+
+print(chart);
+
+//Export
+Export.image.toDrive({
+  image: modeFiltered,
+  description: 'LandCover_RF_L8_L9_6Classes_OOB',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'land_cover_rf_l8_l9_6classes_oob',
+  region: table,
+  scale: scaleM,
+  maxPixels: 1e13,
+  crs: 'EPSG:4326'
+});
+
+//Legend Panel
+var legend = ui.Panel({style:{position:'bottom-left'}});
+legend.add(ui.Label('Legend - Land Cover'));
+for (var i=0; i<lcNamesClient.length; i++){
+  var row = ui.Panel({
+    widgets:[
+      ui.Label({style:{backgroundColor:palette6[i], padding:'8px', margin:'0'}}),
+      ui.Label('  ' + lcNamesClient[i])
+    ],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+  legend.add(row);
+}
+Map.add(legend);
