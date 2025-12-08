@@ -1,0 +1,392 @@
+#GEEcode
+
+// Landsat 8 & 9 LST Seasonal Average in °C with Ordered KMeans Clustering and Validation Metrics
+// Final: Class Areas in Hectares, 5 classes (0-4), Validation Table UI, GeoTIFF exports
+
+
+// 1. بارگذاری محدوده
+var roi = table;
+Map.centerObject(roi, 11);
+
+// 2. آماده‌سازی کالکشن‌ها با ماسک ابری
+function prepCollection(start, end) {
+  var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+    .filterBounds(roi)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUD_COVER', 10))
+    .map(maskL8L9sr);
+    
+  var l9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+    .filterBounds(roi)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUD_COVER', 10))
+    .map(maskL8L9sr);
+  
+  var merged = l8.merge(l9);
+  return merged.map(function(image) {
+    var lst = image.select('ST_B10')
+      .multiply(0.00341802).add(149.0)
+      .subtract(273.15)
+      .rename('LST_C');
+    return lst.clip(roi).copyProperties(image, image.propertyNames());
+  });
+}
+
+// 3. تابع ماسک ابری
+function maskL8L9sr(image) {
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)
+             .and(qa.bitwiseAnd(1 << 4).eq(0))
+             .and(qa.bitwiseAnd(1 << 5).eq(0));
+  return image.updateMask(mask);
+}
+
+// 4. بازه زمانی کلی
+var startDate = '2023-12-01';
+var endDate   = '2024-11-30';
+var coll = prepCollection(startDate, endDate);
+print('Landsat 8 & 9 images:', coll);
+// 5. تعریف فصل‌ها
+var seasons = [
+  {name: 'Winter', start: '2023-12-01', end: '2024-02-28'},
+  {name: 'Spring', start: '2024-03-01', end: '2024-05-31'},
+  {name: 'Summer', start: '2024-06-01', end: '2024-08-31'},
+  {name: 'Fall', start: '2024-09-01', end: '2024-11-30'}
+];
+
+// 6. لیست‌ها برای ذخیره FeatureCollection
+var chartFeatures = [];
+var areaFeatures = [];
+var validationFeatures = [];
+
+// 7. تابع محاسبه مساحت هر کلاس (۵ کلاس) — خروجی بر حسب هکتار
+function calcAreaByClass(clusterImg) {
+  var areas = ee.List.sequence(0, 4).map(function(classNum) { 
+    classNum = ee.Number(classNum);
+    var mask = clusterImg.eq(classNum);
+    var pixelArea = ee.Image.pixelArea().updateMask(mask);
+    var totalArea_m2 = pixelArea.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: roi,
+      scale: 30,
+      maxPixels: 1e13
+    }).get('area');
+    
+    // تبدیل از متر مربع به هکتار
+    var totalArea_ha = ee.Number(totalArea_m2).divide(10000);
+    
+    return ee.Feature(null, {
+      'Class': classNum,
+      'Area_ha': totalArea_ha
+    });
+  });
+  return ee.FeatureCollection(areas);
+}
+
+// 8. تابع محاسبه معیارهای ارزیابی خوشه‌بندی
+function calculateValidationMetrics(meanImg, result, seasonName) {
+  var combined = meanImg.addBands(result.rename('cluster'));
+  var stats = combined.reduceRegion({
+    reducer: ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.count(),
+      sharedInputs: true
+    }).group({
+      groupField: 1,
+      groupName: 'cluster'
+    }),
+    geometry: roi,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  var groups = ee.List(stats.get('groups'));
+  var clusterStats = ee.FeatureCollection(groups.map(function(d) {
+    d = ee.Dictionary(d);
+    return ee.Feature(null, {
+      'cluster': ee.Number(d.get('cluster')),
+      'mean': ee.Number(d.get('mean')),
+      'count': ee.Number(d.get('count'))
+    });
+  }));
+
+  var nonEmptyList = clusterStats.aggregate_array('cluster');
+  var k = nonEmptyList.size();
+  var totalCount = ee.Number(clusterStats.aggregate_sum('count'));
+  var globalMean = ee.Number(meanImg.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('LST_C'));
+
+  var keys = nonEmptyList.map(function(i) { return ee.String(i); });
+  var meanValues = nonEmptyList.map(function(i) {
+    i = ee.Number(i);
+    var feat = clusterStats.filter(ee.Filter.eq('cluster', i)).first();
+    return ee.Feature(feat).getNumber('mean');
+  });
+  var clusterMeans = ee.Dictionary.fromLists(keys, meanValues);
+
+  var countValues = nonEmptyList.map(function(i) {
+    i = ee.Number(i);
+    var feat = clusterStats.filter(ee.Filter.eq('cluster', i)).first();
+    return ee.Feature(feat).getNumber('count');
+  });
+  var clusterCounts = ee.Dictionary.fromLists(keys, countValues);
+
+  var wcssPerCluster = nonEmptyList.map(function(i) {
+    i = ee.Number(i);
+    var cluster_i = result.eq(i).selfMask();
+    var clusterMean = clusterMeans.getNumber(ee.String(i));
+    var diff = meanImg.subtract(clusterMean);
+    var squaredDiff = diff.pow(2).updateMask(cluster_i);
+    return squaredDiff.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: roi,
+      scale: 30,
+      maxPixels: 1e13
+    }).get('LST_C');
+  });
+  var totalWCSS = ee.Number(wcssPerCluster.reduce(ee.Reducer.sum()));
+
+  var bss = ee.Number(0);
+  bss = nonEmptyList.iterate(function(i, acc) {
+    i = ee.Number(i);
+    var clusterMean = clusterMeans.getNumber(ee.String(i));
+    var clusterCount = clusterCounts.getNumber(ee.String(i));
+    var dev = clusterMean.subtract(globalMean);
+    return ee.Number(acc).add(clusterCount.multiply(dev.pow(2)));
+  }, ee.Number(0));
+
+  var chIndex = ee.Number(0);
+  chIndex = ee.Algorithms.If(
+    k.gt(1).and(totalWCSS.gt(0)).and(totalCount.gt(k)),
+    ee.Number(bss).divide(k.subtract(1)).divide(totalWCSS.divide(totalCount.subtract(k))),
+    0
+  );
+
+  var sValues = nonEmptyList.map(function(i) {
+    i = ee.Number(i);
+    var cluster_i = result.eq(i).selfMask();
+    var clusterMean = clusterMeans.getNumber(ee.String(i));
+    var clusterCount = clusterCounts.getNumber(ee.String(i));
+    var absDiff = meanImg.subtract(clusterMean).abs().updateMask(cluster_i);
+    var sumAbs = absDiff.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: roi,
+      scale: 30,
+      maxPixels: 1e13
+    }).get('LST_C');
+    return ee.Number(sumAbs).divide(clusterCount);
+  });
+  var sDict = ee.Dictionary.fromLists(keys, sValues);
+
+  var dbTerms = nonEmptyList.map(function(i) {
+    i = ee.Number(i);
+    var s_i = sDict.getNumber(ee.String(i));
+    var maxRatio = ee.Number(0);
+    maxRatio = nonEmptyList.iterate(function(j, acc) {
+      j = ee.Number(j);
+      var isSame = i.eq(j);
+      var term = ee.Algorithms.If(
+        isSame,
+        ee.Number(0),
+        (function() {
+          var s_j = sDict.getNumber(ee.String(j));
+          var mu_i = clusterMeans.getNumber(ee.String(i));
+          var mu_j = clusterMeans.getNumber(ee.String(j));
+          var d_ij = mu_i.subtract(mu_j).abs();
+          return ee.Algorithms.If(d_ij.gt(0), s_i.add(s_j).divide(d_ij), ee.Number(0));
+        })()
+      );
+      return ee.Number(acc).max(ee.Number(term));
+    }, ee.Number(0));
+    return ee.Number(maxRatio);
+  });
+  var dbIndex = ee.Algorithms.If(k.gt(1), ee.List(dbTerms).reduce(ee.Reducer.mean()), 0);
+
+  var silhouetteScores = nonEmptyList.map(function(i) {
+    i = ee.Number(i);
+    var clusterCount = clusterCounts.getNumber(ee.String(i));
+    var a = sDict.getNumber(ee.String(i));
+    var b_init = ee.Number(1e10);
+    var b = nonEmptyList.iterate(function(j, acc) {
+      j = ee.Number(j);
+      var isSame = i.eq(j);
+      var term = ee.Algorithms.If(isSame, ee.Number(1e10), ee.Number(clusterMeans.getNumber(ee.String(i)).subtract(clusterMeans.getNumber(ee.String(j))).abs()));
+      return ee.Number(acc).min(ee.Number(term));
+    }, b_init);
+    return ee.Algorithms.If(clusterCount.gt(1).and(ee.Number(a).lt(ee.Number(b))),
+      ee.Number(b).subtract(ee.Number(a)).divide(ee.Number(b).max(ee.Number(a))),
+      0
+    );
+  });
+  var silhouetteScore = ee.Algorithms.If(k.gt(1), ee.List(silhouetteScores).reduce(ee.Reducer.mean()), 0);
+
+  var validationFeature = ee.Feature(null, {
+    'Season': seasonName,
+    'Silhouette_Score': silhouetteScore,
+    'Calinski_Harabasz_Index': chIndex,
+    'WCSS': totalWCSS,
+    'Davies_Bouldin_Index': dbIndex
+  });
+  validationFeatures.push(validationFeature);
+}
+
+// 9. پردازش فصلی و خوشه‌بندی KMeans ۵ کلاس
+seasons.forEach(function(season) {
+  var seasonalColl = coll.filterDate(season.start, season.end);
+  var meanImg = seasonalColl.mean().clip(roi);
+
+  Map.addLayer(meanImg, {min:0, max:40, palette:['blue','yellow','red']}, season.name + ' Mean LST');
+
+  Export.image.toDrive({
+    image: meanImg,
+    description: season.name + '_MeanLST',
+    folder: 'GEE_Exports',
+    fileNamePrefix: season.name + '_MeanLST',
+    region: roi,
+    scale: 30,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+
+  var meanVal = ee.Number(meanImg.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: 30
+  }).get('LST_C'));
+
+  chartFeatures.push(ee.Feature(null, {
+    'Season': season.name,
+    'Mean_LST_C': meanVal,
+    'Start_Date': season.start,
+    'End_Date': season.end
+  }));
+
+  var training = meanImg.sample({
+    region: roi,
+    scale: 30,
+    numPixels: 5000
+  });
+
+  var clusterer = ee.Clusterer.wekaKMeans(5).train(training);
+  var result = meanImg.cluster(clusterer).clip(roi);
+
+  calculateValidationMetrics(meanImg, result, season.name);
+
+  // مرتب‌سازی خوشه‌ها بر اساس میانگین LST (همان‌طور که نیاز بود روی دو باند انجام می‌شود)
+  var stats = meanImg.addBands(result.rename('cluster')).reduceRegion({
+    reducer: ee.Reducer.mean().group({groupField: 1, groupName: 'cluster'}),
+    geometry: roi,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  var groups = ee.List(stats.get('groups'));
+  var fc = ee.FeatureCollection(groups.map(function(d) {
+    d = ee.Dictionary(d);
+    return ee.Feature(null, {'cluster': ee.Number(d.get('cluster')), 'mean': ee.Number(d.get('mean'))});
+  }));
+
+  var sorted = fc.sort('mean');
+  var orderedIds = ee.List(sorted.aggregate_array('cluster'));
+  var allIds = ee.List.sequence(0, 4);
+  var missing = allIds.removeAll(orderedIds);
+  var finalOrder = orderedIds.cat(missing);
+  var newIds = ee.List.sequence(0, finalOrder.length().subtract(1));
+  var remapped = result.remap(finalOrder, newIds, -1).rename('Class5');
+
+  var remapped_clean = remapped.toUint8(); // بدون NoData، مقادیر 0..4
+
+  var palette = ['#08306b','#6baed6','#ffffb2','#fb6a4a','#cb181d'];
+  Map.addLayer(remapped_clean, {min:0, max:4, palette: palette}, season.name + ' KMeans5 Classes');
+
+  Export.image.toDrive({
+    image: remapped_clean,
+    description: season.name + '_KMeans5_Classes',
+    folder: 'GEE_Exports',
+    fileNamePrefix: season.name + '_KMeans5_Classes',
+    region: roi,
+    scale: 30,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+
+  // محاسبه مساحت هر کلاس به هکتار و ذخیره
+  var areaFC = calcAreaByClass(remapped_clean).map(function(f) { return f.set('Season', season.name); });
+  areaFeatures.push(areaFC);
+
+  Export.table.toDrive({
+    collection: areaFC,
+    description: season.name + '_KMeans5_Area_ha',
+    folder: 'GEE_Exports',
+    fileNamePrefix: season.name + '_KMeans5_Area_ha',
+    fileFormat: 'CSV'
+  });
+});
+
+// 10. نمودار مساحت کلاس‌ها (هکتار)
+var allAreas = ee.FeatureCollection(areaFeatures).flatten();
+
+var areaChart = ui.Chart.feature.groups(allAreas, 'Class', 'Area_ha', 'Season')
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: 'مساحت طبقات دمایی (هکتار) در هر فصل (۵ کلاس)',
+    hAxis: {title: 'کلاس دما'},
+    vAxis: {title: 'مساحت (ha)'},
+    isStacked: false,
+    series: {0:{color:'#08306b'},1:{color:'#6baed6'},2:{color:'#ffffb2'},3:{color:'#fb6a4a'},4:{color:'#cb181d'}}
+  });
+
+print(areaChart);
+
+// 11. چارت میانگین دما
+var chartFC = ee.FeatureCollection(chartFeatures);
+
+var seasonalChart = ui.Chart.feature.byFeature(chartFC, 'Start_Date', 'Mean_LST_C')
+  .setOptions({
+    title: 'میانگین دمای فصلی در ROI',
+    hAxis: {title: 'تاریخ شروع فصل'},
+    vAxis: {title: 'دمای میانگین (°C)'},
+    lineWidth: 2,
+    pointSize: 6
+  });
+
+print(seasonalChart);
+
+// 12. نمایش معیارهای ارزیابی به‌صورت جدول (UI) و اکسپورت CSV
+var validationFC = ee.FeatureCollection(validationFeatures);
+print('Validation Metrics (Raw):', validationFC);
+
+// جدول UI برای نمایش در کنسول
+var validationTable = ui.Chart.feature.byFeature({
+  features: validationFC,
+  xProperty: 'Season',
+  yProperties: ['Silhouette_Score', 'Calinski_Harabasz_Index', 'WCSS', 'Davies_Bouldin_Index']
+}).setChartType('Table')
+  .setOptions({
+    title: 'معیارهای ارزیابی خوشه‌بندی KMeans برای هر فصل',
+    allowHtml: true,
+    pageSize: 10,
+    sortColumn: 'Season',
+    columns: {
+      Season: {label: 'فصل'},
+      Silhouette_Score: {label: 'امتیاز سیلوئت'},
+      Calinski_Harabasz_Index: {label: 'شاخص کالینسکی-هاراباسز'},
+      WCSS: {label: 'مجموع مربعات درون خوشه‌ای'},
+      Davies_Bouldin_Index: {label: 'شاخص دیویس-بولدین'}
+    }
+  });
+
+print('Validation Metrics Table:', validationTable);
+
+
+Export.table.toDrive({
+  collection: validationFC,
+  description: 'KMeans_Validation_Metrics',
+  folder: 'GEE_Exports',
+  fileNamePrefix: 'KMeans_Validation_Metrics',
+  fileFormat: 'CSV'
+});
