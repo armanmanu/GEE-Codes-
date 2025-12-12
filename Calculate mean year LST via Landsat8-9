@@ -3,12 +3,12 @@
 var table = ee.FeatureCollection('projects/gee-python-456606/assets/StudyArea');
 var geometry = table.geometry();
 
-// پارامترها
+// Parameters
 var startDate = '2023-12-01';
 var endDate   = '2024-11-30';
 var cloudCoverMax = 10;
 
-// ماسک ابر
+// Cloud mask
 var maskClouds = function(image) {
   var qa = image.select('QA_PIXEL');
   var mask = qa.bitwiseAnd(1 << 3).eq(0)     // Cloud
@@ -18,14 +18,14 @@ var maskClouds = function(image) {
   return image.updateMask(mask);
 };
 
-// تبدیل به سلسیوس
+// Convert to celsius
 var addLST = function(image) {
   var lstK = image.select('ST_B10').multiply(0.00341802).add(149.0);
   var lstC = lstK.subtract(273.15).rename('LST_Celsius');
   return image.addBands(lstC);
 };
 
-// مجموعه تصاویر
+// Image collection
 var collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
   .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
   .filterDate(startDate, endDate)
@@ -35,15 +35,15 @@ var collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
   .map(addLST)
   .select('LST_Celsius');
 
-// میانگین سالانه
+// Annual average
 var lstMean = collection.mean().clip(geometry);
 
-// نمایش نقشه اصلی
+// Display the main map
 Map.centerObject(geometry, 10);
 Map.addLayer(lstMean, {min:5, max:50, palette:['blue','cyan','green','yellow','orange','red']}, 
-             'میانگین دمای سطح زمین (°C)');
+             'LST mean (°C)');
 
-// آمار کلی
+// Overall statistics
 var stats = lstMean.reduceRegion({
   reducer: ee.Reducer.mean().combine(ee.Reducer.minMax(), '', true)
                          .combine(ee.Reducer.stdDev(), '', true),
@@ -54,13 +54,13 @@ var stats = lstMean.reduceRegion({
 });
 
 print('════════════════════════════════');
-print('میانگین دما:', ee.Number(stats.get('LST_Celsius_mean')).format('%.2f'), '°C');
-print('کمینه دما: ', ee.Number(stats.get('LST_Celsius_min')).format('%.2f'), '°C');
-print('بیشینه دما:', ee.Number(stats.get('LST_Celsius_max')).format('%.2f'), '°C');
-print('انحراف معیار:', ee.Number(stats.get('LST_Celsius_stdDev')).format('%.2f'), '°C');
+print('LST mean :', ee.Number(stats.get('LST_Celsius_mean')).format('%.2f'), '°C');
+print('Minimum LST : ', ee.Number(stats.get('LST_Celsius_min')).format('%.2f'), '°C');
+print('Maximum LST :', ee.Number(stats.get('LST_Celsius_max')).format('%.2f'), '°C');
+print('Standard deviation :', ee.Number(stats.get('LST_Celsius_stdDev')).format('%.2f'), '°C');
 print('════════════════════════════════');
 
-// ================== پیدا کردن گرم‌ترین و سردترین پیکسل ==================
+// ================== Finding the hottest and coldest pixels ==================
 
 var maxTemp = ee.Number(stats.get('LST_Celsius_max'));
 var minTemp = ee.Number(stats.get('LST_Celsius_min'));
@@ -68,14 +68,14 @@ var minTemp = ee.Number(stats.get('LST_Celsius_min'));
 var hotMask  = lstMean.eq(maxTemp);
 var coldMask = lstMean.eq(minTemp);
 
-// تبدیل ماسک به نقاط مرکزی پیکسل + اضافه کردن پراپرتی
+
 var hotPoints = hotMask.selfMask().reduceToVectors({
   geometry: geometry,
   scale: 30,
   geometryType: 'centroid',
   maxPixels: 1e13
 }).map(function(f) {
-  return f.set({Type: 'گرم‌ترین نقطه', LST_C: maxTemp.format('%.2f')});
+  return f.set({Type: 'Warmest point', LST_C: maxTemp.format('%.2f')});
 });
 
 var coldPoints = coldMask.selfMask().reduceToVectors({
@@ -84,32 +84,31 @@ var coldPoints = coldMask.selfMask().reduceToVectors({
   geometryType: 'centroid',
   maxPixels: 1e13
 }).map(function(f) {
-  return f.set({Type: 'سردترین نقطه', LST_C: minTemp.format('%.2f')});
+  return f.set({Type: 'Coldest point ', LST_C: minTemp.format('%.2f')});
 });
 
-// اینجا مهم است: حتی اگر فقط یک نقطه باشد، به FeatureCollection تبدیل می‌کنیم
-var hotFC  = ee.FeatureCollection(hotPoints.limit(1));   // همیشه FeatureCollection
-var coldFC = ee.FeatureCollection(coldPoints.limit(1));  // همیشه FeatureCollection
 
-var extremePoints = hotFC.merge(coldFC);  // حالا کاملاً معتبر است
+var hotFC  = ee.FeatureCollection(hotPoints.limit(1));   //  FeatureCollection
+var coldFC = ee.FeatureCollection(coldPoints.limit(1));  //  FeatureCollection
 
-// ================== نمایش بدون هیچ خطایی روی نقشه ==================
+var extremePoints = hotFC.merge(coldFC);  
+
 
 Map.addLayer(hotFC.style({
   color: 'red',
   fillColor: 'red',
   width: 5,
   pointSize: 20
-}), {}, 'گرم‌ترین نقطه');
+}), {}, 'Warmest point');
 
 Map.addLayer(coldFC.style({
   color: 'cyan',
   fillColor: 'cyan',
   width: 5,
   pointSize: 20
-}), {}, 'سردترین نقطه');
+}), {}, 'Coldest point');
 
-// نمایش هر دو با هم
+
 Map.addLayer(extremePoints.style({
   pointSize: 18,
   width: 4,
@@ -117,12 +116,12 @@ Map.addLayer(extremePoints.style({
   fillColor: 'black'
 }), {}, 'نقاط اکستریم');
 
-// ================== چاپ و اکسپورت ==================
-print('گرم‌ترین نقطه:', hotPoints.first());
-print('سردترین نقطه:', coldPoints.first());
-print('مجموعه نهایی برای اکسپورت (FeatureCollection):', extremePoints);
+// ================== Export and print ==================
+print('Warmest point:', hotPoints.first());
+print('Coldest point:', coldPoints.first());
+print('(FeatureCollection):', extremePoints);
 
-// اکسپورت به Shapefile (کاملاً کار می‌کند)
+// Export to Shapefile
 Export.table.toDrive({
   collection: extremePoints,
   description: 'LST_Extreme_Points_StudyArea',
@@ -131,7 +130,7 @@ Export.table.toDrive({
   fileFormat: 'SHP'
 });
 
-// اکسپورت تصویر میانگین
+// Export mean
 Export.image.toDrive({
   image: lstMean.toFloat(),
   description: 'LST_Annual_Mean_StudyArea',
