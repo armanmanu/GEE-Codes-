@@ -4,11 +4,11 @@
 // Final: Class Areas in Hectares, 5 classes (0-4), Validation Table UI, GeoTIFF exports
 
 
-// 1. بارگذاری محدوده
+// 1. Load study area
 var roi = table;
 Map.centerObject(roi, 11);
 
-// 2. آماده‌سازی کالکشن‌ها با ماسک ابری
+// 2. Cloud mask
 function prepCollection(start, end) {
   var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
     .filterBounds(roi)
@@ -32,7 +32,7 @@ function prepCollection(start, end) {
   });
 }
 
-// 3. تابع ماسک ابری
+// 3. Cloud masking function
 function maskL8L9sr(image) {
   var qa = image.select('QA_PIXEL');
   var mask = qa.bitwiseAnd(1 << 3).eq(0)
@@ -41,12 +41,12 @@ function maskL8L9sr(image) {
   return image.updateMask(mask);
 }
 
-// 4. بازه زمانی کلی
+// 4. Range time
 var startDate = '2023-12-01';
 var endDate   = '2024-11-30';
 var coll = prepCollection(startDate, endDate);
 print('Landsat 8 & 9 images:', coll);
-// 5. تعریف فصل‌ها
+// 5. Defining seasons
 var seasons = [
   {name: 'Winter', start: '2023-12-01', end: '2024-02-28'},
   {name: 'Spring', start: '2024-03-01', end: '2024-05-31'},
@@ -54,12 +54,12 @@ var seasons = [
   {name: 'Fall', start: '2024-09-01', end: '2024-11-30'}
 ];
 
-// 6. لیست‌ها برای ذخیره FeatureCollection
+// 6. Save FeatureCollection
 var chartFeatures = [];
 var areaFeatures = [];
 var validationFeatures = [];
 
-// 7. تابع محاسبه مساحت هر کلاس (۵ کلاس) — خروجی بر حسب هکتار
+// 7. Calculate area(ha)
 function calcAreaByClass(clusterImg) {
   var areas = ee.List.sequence(0, 4).map(function(classNum) { 
     classNum = ee.Number(classNum);
@@ -72,7 +72,7 @@ function calcAreaByClass(clusterImg) {
       maxPixels: 1e13
     }).get('area');
     
-    // تبدیل از متر مربع به هکتار
+    // Conver m2 to he
     var totalArea_ha = ee.Number(totalArea_m2).divide(10000);
     
     return ee.Feature(null, {
@@ -83,7 +83,7 @@ function calcAreaByClass(clusterImg) {
   return ee.FeatureCollection(areas);
 }
 
-// 8. تابع محاسبه معیارهای ارزیابی خوشه‌بندی
+// 8. Calculating clustring metrics
 function calculateValidationMetrics(meanImg, result, seasonName) {
   var combined = meanImg.addBands(result.rename('cluster'));
   var stats = combined.reduceRegion({
@@ -233,7 +233,7 @@ function calculateValidationMetrics(meanImg, result, seasonName) {
   validationFeatures.push(validationFeature);
 }
 
-// 9. پردازش فصلی و خوشه‌بندی KMeans ۵ کلاس
+// 9. K-means clustering
 seasons.forEach(function(season) {
   var seasonalColl = coll.filterDate(season.start, season.end);
   var meanImg = seasonalColl.mean().clip(roi);
@@ -275,7 +275,7 @@ seasons.forEach(function(season) {
 
   calculateValidationMetrics(meanImg, result, season.name);
 
-  // مرتب‌سازی خوشه‌ها بر اساس میانگین LST (همان‌طور که نیاز بود روی دو باند انجام می‌شود)
+  // Sorting clusters based on LST
   var stats = meanImg.addBands(result.rename('cluster')).reduceRegion({
     reducer: ee.Reducer.mean().group({groupField: 1, groupName: 'cluster'}),
     geometry: roi,
@@ -297,7 +297,7 @@ seasons.forEach(function(season) {
   var newIds = ee.List.sequence(0, finalOrder.length().subtract(1));
   var remapped = result.remap(finalOrder, newIds, -1).rename('Class5');
 
-  var remapped_clean = remapped.toUint8(); // بدون NoData، مقادیر 0..4
+  var remapped_clean = remapped.toUint8(); //  NoData،  0..4
 
   var palette = ['#08306b','#6baed6','#ffffb2','#fb6a4a','#cb181d'];
   Map.addLayer(remapped_clean, {min:0, max:4, palette: palette}, season.name + ' KMeans5 Classes');
@@ -314,7 +314,7 @@ seasons.forEach(function(season) {
     fileFormat: 'GeoTIFF'
   });
 
-  // محاسبه مساحت هر کلاس به هکتار و ذخیره
+  // Calculating area(he)
   var areaFC = calcAreaByClass(remapped_clean).map(function(f) { return f.set('Season', season.name); });
   areaFeatures.push(areaFC);
 
@@ -327,56 +327,56 @@ seasons.forEach(function(season) {
   });
 });
 
-// 10. نمودار مساحت کلاس‌ها (هکتار)
+// 10. Chart of classes area(ha)
 var allAreas = ee.FeatureCollection(areaFeatures).flatten();
 
 var areaChart = ui.Chart.feature.groups(allAreas, 'Class', 'Area_ha', 'Season')
   .setChartType('ColumnChart')
   .setOptions({
-    title: 'مساحت طبقات دمایی (هکتار) در هر فصل (۵ کلاس)',
-    hAxis: {title: 'کلاس دما'},
-    vAxis: {title: 'مساحت (ha)'},
+    title: 'Area of temperature classes seasons',
+    hAxis: {title: 'LST class'},
+    vAxis: {title: 'Area (ha)'},
     isStacked: false,
     series: {0:{color:'#08306b'},1:{color:'#6baed6'},2:{color:'#ffffb2'},3:{color:'#fb6a4a'},4:{color:'#cb181d'}}
   });
 
 print(areaChart);
 
-// 11. چارت میانگین دما
+// 11. Chart of mean LST
 var chartFC = ee.FeatureCollection(chartFeatures);
 
 var seasonalChart = ui.Chart.feature.byFeature(chartFC, 'Start_Date', 'Mean_LST_C')
   .setOptions({
-    title: 'میانگین دمای فصلی در ROI',
-    hAxis: {title: 'تاریخ شروع فصل'},
-    vAxis: {title: 'دمای میانگین (°C)'},
+    title: 'Seasonal average LST ROI',
+    hAxis: {title: 'Season start date'},
+    vAxis: {title: 'LST mean (°C)'},
     lineWidth: 2,
     pointSize: 6
   });
 
 print(seasonalChart);
 
-// 12. نمایش معیارهای ارزیابی به‌صورت جدول (UI) و اکسپورت CSV
+// 12. Table of evaluation metrics
 var validationFC = ee.FeatureCollection(validationFeatures);
 print('Validation Metrics (Raw):', validationFC);
 
-// جدول UI برای نمایش در کنسول
+
 var validationTable = ui.Chart.feature.byFeature({
   features: validationFC,
   xProperty: 'Season',
   yProperties: ['Silhouette_Score', 'Calinski_Harabasz_Index', 'WCSS', 'Davies_Bouldin_Index']
 }).setChartType('Table')
   .setOptions({
-    title: 'معیارهای ارزیابی خوشه‌بندی KMeans برای هر فصل',
+    title: 'evaluation metrics KMeans foe seasons',
     allowHtml: true,
     pageSize: 10,
     sortColumn: 'Season',
     columns: {
-      Season: {label: 'فصل'},
-      Silhouette_Score: {label: 'امتیاز سیلوئت'},
-      Calinski_Harabasz_Index: {label: 'شاخص کالینسکی-هاراباسز'},
-      WCSS: {label: 'مجموع مربعات درون خوشه‌ای'},
-      Davies_Bouldin_Index: {label: 'شاخص دیویس-بولدین'}
+       Season: {label: 'Season'},
+      Silhouette_Score: {label: 'Silhouette_Score'},
+      Calinski_Harabasz_Index: {label: 'Calinski_Harabasz_Index'},
+      WCSS: {label: 'WCSS'},
+      Davies_Bouldin_Index: {label: 'Davies_Bouldin_Index'}
     }
   });
 
