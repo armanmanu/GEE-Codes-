@@ -1,12 +1,12 @@
 #GEEcode
-// ================== لندست ۵ و ۷ – نسخه نهایی با نقاط Max/Min و Shapefile ==================
+
 var table = ee.FeatureCollection('projects/gee-python-456606/assets/StudyArea');
-var geometry = table.geometry(); // تبدیل شیپ‌فایل به Geometry
+var geometry = table.geometry(); 
 var startDate = '1999-12-01';
-var endDate = '2000-11-30'; // مثال یک سال کامل
+var endDate = '2000-11-30'; 
 var cloudCoverMax = 10;
 
-// ماسک ابر دقیق برای لندست ۵ و ۷
+// Cloud Mask
 var maskL5L7 = function(image) {
   var qa = image.select('QA_PIXEL');
   var mask = qa.bitwiseAnd(1 << 3).eq(0) // Cloud
@@ -16,14 +16,14 @@ var maskL5L7 = function(image) {
   return image.updateMask(mask);
 };
 
-// محاسبه LST به سلسیوس
+// Calculate LST
 var addLST = function(image) {
   var lstK = image.select('ST_B6').multiply(0.00341802).add(149.0);
   var lstC = lstK.subtract(273.15).rename('LST_C');
   return image.addBands(lstC);
 };
 
-// مجموعه تصاویر – ترتیب فیلترها دقیقاً حفظ شده
+
 var landsat = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
                 .merge(ee.ImageCollection('LANDSAT/LE07/C02/T1_L2'))
                 .filterDate(startDate, endDate)
@@ -35,19 +35,18 @@ var landsat = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
 
 var lstMean = landsat.mean().clip(geometry);
 
-// نمایش میانگین دما
+//Display the average temprature
 Map.centerObject(geometry, 10);
 Map.addLayer(lstMean, {
   min: 0, max: 45,
   palette: ['#000080','#0080ff','#00ffff','#00ff80','#ffff00','#ff8000','#ff0000']
 }, 'میانگین دمای سطح – لندست ۵ و ۷ (°C)');
 
-// ═══════════════════════════════════════════════════════════════════════
-// ۱- پیدا کردن پیکسل‌های بیشینه و کمینه + تبدیل به نقطه
-// ═══════════════════════════════════════════════════════════════════════
+
+//Finding the minimum and maximum temprature pixels
 var lstFloat = lstMean.toFloat();
 
-// مقدار بیشینه و کمینه
+// Minimum and maximum temprature values
 var maxVal = ee.Number(lstFloat.reduceRegion({
   reducer: ee.Reducer.max(),
   geometry: geometry,
@@ -64,18 +63,18 @@ var minVal = ee.Number(lstFloat.reduceRegion({
   bestEffort: true
 }).get('LST_C'));
 
-// ماسک پیکسل‌های برابر با بیشینه/کمینه
+
 var maxMask = lstFloat.eq(maxVal);
 var minMask = lstFloat.eq(minVal);
 
-// تبدیل به نقاط (centroid) – استفاده صحیح از labelProperty
+//Convert to point
 var maxPoints = maxMask.selfMask().reduceToVectors({
   reducer: ee.Reducer.countEvery(),
   geometry: geometry,
   scale: 30,
   maxPixels: 1e13,
   geometryType: 'centroid',
-  labelProperty: 'type'   // این پارامتر درست است
+  labelProperty: 'type'   
 });
 
 var minPoints = minMask.selfMask().reduceToVectors({
@@ -87,37 +86,37 @@ var minPoints = minMask.selfMask().reduceToVectors({
   labelProperty: 'type'
 });
 
-// اضافه کردن مقدار دما و توضیحات
+// Add temprature values
 maxPoints = maxPoints.map(function(f) {
   return f.set({
     'LST_C': maxVal.format('%.2f'),
-    'type': 'بیشینه',
-    'توضیح': 'گرم‌ترین نقطه در میانگین سالانه LST'
+    'type': 'Maximum',
+    'Explanation': 'The warmest point of LST'
   });
 });
 
 minPoints = minPoints.map(function(f) {
   return f.set({
     'LST_C': minVal.format('%.2f'),
-    'type': 'کمینه',
-    'توضیح': 'سردترین نقطه در میانگین سالانه LST'
+    'type': 'Minimum',
+    'Explanation': 'The coldest point of LST LST'
   });
 });
 
-// ترکیب دو مجموعه
+
 var extremePoints = maxPoints.merge(minPoints);
 
-// نمایش نقاط روی نقشه (قرمز = گرم، آبی = سرد)
+// Displaying points on the map, with red indicating the warmest and blue the coldest
 Map.addLayer(maxPoints.style({color: 'red', pointSize: 10, width: 3}), {}, '● گرم‌ترین نقطه');
 Map.addLayer(minPoints.style({color: 'cyan', pointSize: 10, width: 3}), {}, '● سردترین نقطه');
 
-// چاپ اطلاعات
-print('دمای بیشینه (نقطه قرمز):', maxVal.format('%.2f'), '°C');
-print('دمای کمینه (نقطه آبی):', minVal.format('%.2f'), '°C');
-print('نقاط بیشینه و کمینه (آماده Export به Shapefile):', extremePoints);
+// Print information
+print('Maximum (Red point):', maxVal.format('%.2f'), '°C');
+print('Minimum (Blue point):', minVal.format('%.2f'), '°C');
+print('Maximum and Minimum points (Export به Shapefile):', extremePoints);
 
 // ═══════════════════════════════════════════════════════════════════════
-// ۲- خروجی Shapefile نقاط Max/Min
+// 2- Export Shapefile نقاط Max/Min
 // ═══════════════════════════════════════════════════════════════════════
 Export.table.toDrive({
   collection: extremePoints,
@@ -127,9 +126,7 @@ Export.table.toDrive({
   fileFormat: 'SHP'
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// آمار قبلی (کاملاً بدون تغییر)
-// ═══════════════════════════════════════════════════════════════════════
+// Previous statistics remain unchanged
 var stats = lstMean.reduceRegion({
   reducer: ee.Reducer.mean().combine(ee.Reducer.minMax(), '', true).combine(ee.Reducer.stdDev(), '', true),
   geometry: geometry,
@@ -137,18 +134,18 @@ var stats = lstMean.reduceRegion({
   maxPixels: 1e13
 });
 
-print('════════════════════════════════');
-print(' آمار دمای سطح زمین (لندست ۵ و ۷)');
-print('منطقه:', 'StudyArea');
-print('بازه:', startDate, 'تا', endDate);
-print('تعداد تصاویر:', landsat.size());
-print('میانگین دما: ', ee.Number(stats.get('LST_C_mean')).format('%.2f'), '°C');
-print('کمینه: ', ee.Number(stats.get('LST_C_min')).format('%.2f'), '°C');
-print('بیشینه: ', ee.Number(stats.get('LST_C_max')).format('%.2f'), '°C');
-print('انحراف معیار: ', ee.Number(stats.get('LST_C_stdDev')).format('%.2f'), '°C');
+
+print('Statistics of temp (landsat 5,7');
+print('Region:', 'StudyArea');
+print('Range:', startDate, 'to', endDate);
+print('Number of images :', landsat.size());
+print('Average temperature : ', ee.Number(stats.get('LST_C_mean')).format('%.2f'), '°C');
+print('Minimum: ', ee.Number(stats.get('LST_C_min')).format('%.2f'), '°C');
+print('Maximum: ', ee.Number(stats.get('LST_C_max')).format('%.2f'), '°C');
+print('Standard deviation : ', ee.Number(stats.get('LST_C_stdDev')).format('%.2f'), '°C');
 print('════════════════════════════════');
 
-// خروجی GeoTIFF میانگین دما
+// Export LST
 Export.image.toDrive({
   image: lstMean.toFloat(),
   description: 'LST_Mean_L5L7_StudyArea',
