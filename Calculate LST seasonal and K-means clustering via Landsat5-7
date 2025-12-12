@@ -1,9 +1,9 @@
 #GEE
-// 1. بارگذاری محدوده
+// 1. Load study area 
 var roi = table;
 Map.centerObject(roi, 11);
 
-// 2. آماده‌سازی کالکشن‌ها با ماسک ابری صحیح
+// 2. Cloud mask
 function prepCollection(start, end) {
   var l5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
     .filterBounds(roi)
@@ -27,7 +27,7 @@ function prepCollection(start, end) {
   });
 }
 
-// 3. توابع ماسک ابری
+// 3. Cloud masking function
 function maskL7sr(image) {
   var qa = image.select('QA_PIXEL');
   var mask = qa.bitwiseAnd(1 << 3).eq(0)
@@ -44,13 +44,13 @@ function maskL5sr(image) {
   return image.updateMask(mask);
 }
 
-// 4. بازه زمانی کلی
+// 4. Range time
 var startDate = '1999-12-01';
 var endDate   = '2000-11-30';
 var coll = prepCollection(startDate, endDate);
 print('Landsat 5 & 7 images:', coll);
 
-// 5. تعریف فصل‌ها
+// 5. Defining seasons
 var seasons = [
   {name: 'Winter', start: '1999-12-01', end: '2000-02-29'},
   {name: 'Spring', start: '2000-03-01', end: '2000-05-31'},
@@ -58,12 +58,12 @@ var seasons = [
   {name: 'Autumn', start: '2000-09-01', end: '2000-11-30'}
 ];
 
-// 6. لیست‌ها برای ذخیره FeatureCollection
+// 6. Save FeatureCollection
 var chartFeatures = [];
 var areaFeatures = [];
 var validationFeatures = [];
 
-// 7. تابع محاسبه مساحت هر کلاس (۵ کلاس) — خروجی بر حسب هکتار
+// 7. Calculate area(ha)
 function calcAreaByClass(clusterImg) {
   var areas = ee.List.sequence(0, 4).map(function(classNum) { 
     classNum = ee.Number(classNum);
@@ -75,7 +75,7 @@ function calcAreaByClass(clusterImg) {
       scale: 30,
       maxPixels: 1e13
     }).get('area');
-    // اگر null باشد (مثلاً کلاس در ROI وجود نداشته)، مقدار 0 قرار می‌دهیم
+    
     totalArea_m2 = ee.Algorithms.If(ee.Algorithms.IsEqual(totalArea_m2, null), 0, totalArea_m2);
     var totalArea_ha = ee.Number(totalArea_m2).divide(10000);
     return ee.Feature(null, {'Class': classNum, 'Area_ha': totalArea_ha});
@@ -83,7 +83,7 @@ function calcAreaByClass(clusterImg) {
   return ee.FeatureCollection(areas);
 }
 
-// 8. تابع محاسبه معیارهای ارزیابی خوشه‌بندی (بدون تغییر)
+// 8. Calculating clustring metrics
 function calculateValidationMetrics(meanImg, result, seasonName) {
   var combined = meanImg.addBands(result.rename('cluster'));
   var stats = combined.reduceRegion({
@@ -320,7 +320,7 @@ seasons.forEach(function(season) {
     fileFormat: 'GeoTIFF'
   });
 
-  // محاسبه مساحت هر کلاس به هکتار و افزودن به لیست
+  // Calculating the area of classes
   var areaFC = calcAreaByClass(remapped_clean).map(function(f) { return f.set('Season', season.name); });
   areaFeatures.push(areaFC);
 
@@ -333,36 +333,36 @@ seasons.forEach(function(season) {
   });
 });
 
-// 10. نمودار مساحت کلاس‌ها (هکتار)
+// 10. Chart of classes area(ha)
 var allAreas = ee.FeatureCollection(areaFeatures).flatten();
 
 var areaChart = ui.Chart.feature.groups(allAreas, 'Class', 'Area_ha', 'Season')
   .setChartType('ColumnChart')
   .setOptions({
-    title: 'مساحت طبقات دمایی (هکتار) در هر فصل (۵ کلاس)',
-    hAxis: {title: 'کلاس دما'},
-    vAxis: {title: 'مساحت (ha)'},
+    title: 'Area of temperature classes seasons',
+    hAxis: {title: 'Temperature classes '},
+    vAxis: {title: 'Area (ha)'},
     isStacked: false,
     series: {0:{color:'#08306b'},1:{color:'#6baed6'},2:{color:'#fff7bc'},3:{color:'#fb6a4a'},4:{color:'#cb181d'}}
   });
 
 print(areaChart);
 
-// 11. چارت میانگین دما
+// 11. Chart of mean LST
 var chartFC = ee.FeatureCollection(chartFeatures);
 
 var seasonalChart = ui.Chart.feature.byFeature(chartFC, 'Start_Date', 'Mean_LST_C')
   .setOptions({
-    title: 'میانگین دمای فصلی در ROI',
-    hAxis: {title: 'تاریخ شروع فصل'},
-    vAxis: {title: 'دمای میانگین (°C)'},
+    title: 'Seasonal average LST ROI',
+    hAxis: {title: 'Season start date'},
+    vAxis: {title: 'LST mean (°C)'},
     lineWidth: 2,
     pointSize: 6
   });
 
 print(seasonalChart);
 
-// 12. نمایش معیارهای ارزیابی به‌صورت جدول
+// 12. Table of evaluation metrics
 var validationFC = ee.FeatureCollection(validationFeatures);
 print('Validation Metrics (Raw):', validationFC);
 
@@ -372,22 +372,22 @@ var validationTable = ui.Chart.feature.byFeature({
   yProperties: ['Silhouette_Score', 'Calinski_Harabasz_Index', 'WCSS', 'Davies_Bouldin_Index']
 }).setChartType('Table')
   .setOptions({
-    title: 'معیارهای ارزیابی خوشه‌بندی KMeans برای هر فصل',
+    title: 'evaluation metrics KMeans foe seasons',
     allowHtml: true,
     pageSize: 10,
     sortColumn: 'Season',
     columns: {
-      Season: {label: 'فصل'},
-      Silhouette_Score: {label: 'امتیاز سیلوئت'},
-      Calinski_Harabasz_Index: {label: 'شاخص کالینسکی-هاراباسز'},
-      WCSS: {label: 'مجموع مربعات درون خوشه‌ای'},
-      Davies_Bouldin_Index: {label: 'شاخص دیویس-بولدین'}
+      Season: {label: 'Season'},
+      Silhouette_Score: {label: 'Silhouette_Score'},
+      Calinski_Harabasz_Index: {label: 'Calinski_Harabasz_Index'},
+      WCSS: {label: 'WCSS'},
+      Davies_Bouldin_Index: {label: 'Davies_Bouldin_Index'}
     }
   });
 
 print('Validation Metrics Table:', validationTable);
 
-// 13. خروجی CSV معیارهای ارزیابی
+// 13. evaluation metrics export(CSV)
 Export.table.toDrive({
   collection: validationFC,
   description: 'KMeans_Validation_Metrics',
