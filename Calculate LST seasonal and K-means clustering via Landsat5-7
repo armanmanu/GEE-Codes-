@@ -233,7 +233,7 @@ function calculateValidationMetrics(meanImg, result, seasonName) {
   validationFeatures.push(validationFeature);
 }
 
-// 9. پردازش فصلی و خوشه‌بندی KMeans با ۵ کلاس
+// 9. K-means clustering
 seasons.forEach(function(season) {
   var seasonalColl = coll.filterDate(season.start, season.end);
   var meanImg = seasonalColl.mean().clip(roi);
